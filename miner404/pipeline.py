@@ -19,7 +19,6 @@ random choices are seeded from the round seed and the image hash.
 
 from __future__ import annotations
 
-import colorsys
 import difflib
 import hashlib
 import io
@@ -41,7 +40,6 @@ from openai.types.responses.response_create_params import ResponseCreateParamsBa
 from witness_client import ExchangePending, RenderOptions, RenderRejected, RenderUnavailable, WitnessError
 
 from . import match, patch, prompts
-from .silver_guide import silver_guide
 from .texfix import texfix
 from .powfix import fix_unary_pow
 from .budget import CALL_LIMIT, CREDIT_LIMIT, PRICING, SAFETY, Budget, worst_case
@@ -422,30 +420,6 @@ def chain_wrapper(fill: float, glow: float = 0.0, outline_fit: bool = False) -> 
 _EXPORT = re.compile(r"export\s+default\s+function\s*(?:[A-Za-z_$][\w$]*\s*)?\(")
 
 
-SILVER_AFTER = "m.metalness = 1.0; m.roughness = Math.max(0.25, m.roughness === undefined ? 0.25 : m.roughness);"  # the metal pass line the silver guide keys its roughness test on
-SATURATION = 1.15  # colour literals on colour lines: HSV saturation times this (1.0 = off)
-
-
-_HEX = re.compile(r"(0x|#)([0-9a-fA-F]{6})\b")
-_COLOUR_LINE = re.compile(r"colou?r|fillStyle|strokeStyle|addColorStop", re.I)
-_NOT_SURFACE = re.compile(r"emissive|background|clearColor|fog", re.I)
-
-
-def saturated(source: str | None, factor: float = SATURATION) -> str | None:
-    """The module with the HSV saturation of every 6-digit colour literal on a colour line multiplied by `factor` (capped
-    at 1); emissive, background, clear and fog lines are left alone. Deterministic text edit, no model calls."""
-    if not source or factor == 1.0:
-        return source
-
-    def one(m: re.Match[str]) -> str:
-        h, s, v = colorsys.rgb_to_hsv(*[int(m.group(2)[i:i + 2], 16) / 255 for i in (0, 2, 4)])
-        out = "".join(f"{round(x * 255):02x}" for x in colorsys.hsv_to_rgb(h, min(1.0, s * factor), v))
-        return m.group(1) + (out.upper() if m.group(2).isupper() else out)
-
-    return "\n".join(_HEX.sub(one, line) if _COLOUR_LINE.search(line) and not _NOT_SURFACE.search(line) else line
-                     for line in source.split("\n"))
-
-
 class ModelCalls(Protocol):
     def create(self, *, request_id: int = 0, **params: Unpack[ResponseCreateParamsBase]) -> Response: ...
 
@@ -618,7 +592,6 @@ class StagePlan:
     astra_last: bool = False  # the planner lowers Sol xhigh rounds to Sol high first and touches Astra rounds only after them
     replan: bool = False  # the planner runs before every round from round 2 (see fit_rest): merges, some xhigh, then Astra give way
     merge_pick: bool = False  # after the draft pick: a critique of every draft, then one module merged from the best base and two others
-    merge_stack: bool = False  # the draft merge in two draws and a merge of the two (merged_stack)
     tone: bool = False  # the finished module gets slightly more contrast and colour
     outline_fit_last: bool = False
     post_pick_effort: str = "xhigh"  # effort of the rewrites of the final pick
@@ -759,69 +732,6 @@ class Pipeline:
             plan[i] = replace(plan[i], rewrites=(cheaper,))
         self.planned = [s.rewrites[0] if s.rewrites else None for s in plan]
         return plan
-
-    def merged_stack(self, pool: ThreadPoolExecutor, drafts: list[Candidate], picked: Candidate) -> Candidate:
-        """A Sol-high critique of every draft; two independent merges of the best base and the two drafts with the most
-        strengths, each shown their code, notes and renders; a Sol-high critique of the two merges and one merge of them.
-        Falls back to a single merge, then to the pick."""
-        if len(drafts) < 2:
-            return picked
-        image = lambda b: {"type": "input_image", "image_url": data_url(b), "detail": "high"}
-
-        def critique(by: dict[str, Candidate], request_id: int) -> tuple[dict[str, Any], str] | None:
-            content: list[dict[str, Any]] = [{"type": "input_text", "text": "TARGET:"}, self.target, *self.closeup]
-            for label, d in by.items():
-                content += [{"type": "input_text", "text": f"CANDIDATE {label} FRONT VIEWS:"}, image(d.front),
-                            {"type": "input_text", "text": f"CANDIDATE {label} GRID:"}, image(d.sides)]
-            content.append({"type": "input_text", "text": prompts.CRITIQUE_USER})
-            reply = self.run_stage(pool, [Call(request_id, SOL, prompts.CRITIQUE_SYSTEM, content, "high", 16384,
-                                               text=prompts.critique_schema(list(by)))])[0]
-            try:
-                c = json.loads(reply.output_text) if reply is not None else None
-                notes = {e["label"]: e for e in c["candidates"] if e.get("label") in by}
-                return notes, (c["base"] if c.get("base") in by else list(by)[0])
-            except (ValueError, TypeError, KeyError, AttributeError):
-                return None
-
-        def block(by, notes, label, role):
-            n = notes.get(label, {})
-            return (f"{role} MODULE (candidate {label})\nStrengths: " + "; ".join(n.get("strengths", [])) + "\nWeaknesses: "
-                    + "; ".join(n.get("weaknesses", [])) + f"\n```javascript\n{by[label].raw}\n```")
-
-        def shown(by, roles):
-            out: list[dict[str, Any]] = []
-            for label, role in roles:
-                out += [{"type": "input_text", "text": f"{role} MODULE (candidate {label}) as rendered, front views:"}, image(by[label].front),
-                        {"type": "input_text", "text": f"{role} MODULE (candidate {label}) as rendered, second-stage grid:"},
-                        image(by[label].sides)]
-            return out
-
-        labels = [chr(65 + i) for i in range(len(drafts))]
-        by = dict(zip(labels, drafts, strict=True))
-        first = critique(by, CRITIQUE_ID)
-        if first is None:
-            return picked
-        notes, base = first
-        others = sorted((l for l in labels if l != base), key=lambda l: -len(notes.get(l, {}).get("strengths", [])))[:2]
-        self.merge_base = by[base].name
-        text = prompts.MERGE_PICK + "\n\n" + block(by, notes, base, "BASE") + "".join("\n\n" + block(by, notes, l, "OTHER") for l in others)
-        content = [{"type": "input_text", "text": text}, self.target, *self.closeup, *shown(by, [(base, "BASE"), *((l, "OTHER") for l in others)])]
-        a, b = self.modules(pool, [Call(CRITIQUE_ID + 10, SOL, self.instructions, content, "high", GENERATE_MAX_OUTPUT),
-                                   Call(CRITIQUE_ID + 15, SOL, self.instructions, list(content), "high", GENERATE_MAX_OUTPUT)], ["dm", "dm2"])
-        if a is None or b is None:
-            return a or b or picked
-        pair = {"A": a, "B": b}
-        second = critique(pair, CRITIQUE_ID + 40)
-        if second is None:
-            return a
-        n2, b2 = second
-        o2 = "B" if b2 == "A" else "A"
-        text2 = prompts.MERGE_PICK + "\n\n" + block(pair, n2, b2, "BASE") + "\n\n" + block(pair, n2, o2, "OTHER")
-        call = Call(CRITIQUE_ID + 50, SOL, self.instructions,
-                    [{"type": "input_text", "text": text2}, self.target, *self.closeup, *shown(pair, [(b2, "BASE"), (o2, "OTHER")])],
-                    "high", GENERATE_MAX_OUTPUT)
-        merged = self.modules(pool, [call], ["dm"])[0]
-        return merged if merged is not None else pair[b2]
 
     def merged_pick(self, pool: ThreadPoolExecutor, drafts: list[Candidate], picked: Candidate) -> Candidate:
         """A critique of every draft against the target, then one module merged from the best base and the two other drafts
@@ -1396,7 +1306,7 @@ class Pipeline:
                 drafts = survivors
                 survivors = self.drafts_kept(pool, survivors, plan)
                 if plan.merge_pick:
-                    survivors = [(self.merged_stack if plan.merge_stack else self.merged_pick)(pool, drafts, survivors[0]), *survivors[1:]]
+                    survivors = [self.merged_pick(pool, drafts, survivors[0]), *survivors[1:]]
                 self.best_so_far = survivors[0].source
             searched = False
             steps = list(plan.steps)
@@ -1424,7 +1334,7 @@ class Pipeline:
             source = self.stronger_metal(self.fitted_last(winner, plan) if plan.outline_fit_last else winner.source)
             if plan.tone:
                 source = self.toned(source)
-            return self.texfixed(self.silvered(saturated(source)))
+            return self.texfixed(source)
 
     def texfixed(self, source: str | None) -> str | None:
         """The finished module with smooth sampling on unfiltered data textures (texfix.py); as it is when nothing changes
@@ -1432,20 +1342,6 @@ class Pipeline:
         if not source:
             return source
         candidate = texfix(source)
-        if candidate == source:
-            return source
-        try:
-            self.renderer.render(candidate, FRONT_JUDGE)
-        except RenderRejected:
-            return source
-        return candidate
-
-    def silvered(self, source: str | None) -> str | None:
-        """The finished module with reflection bands on plain polished silver; as it is when nothing qualifies or the
-        renderer refuses the painted module (one render of the judge's front views, no model calls)."""
-        if not source or source.count(SILVER_AFTER) != 1:  # only where the final metal pass ran (as tested)
-            return source
-        candidate = silver_guide(source)
         if candidate == source:
             return source
         try:
